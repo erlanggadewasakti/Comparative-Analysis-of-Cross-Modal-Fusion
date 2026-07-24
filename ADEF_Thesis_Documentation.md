@@ -18,6 +18,38 @@ ADEF classifies sentiment (Negative / Neutral / Positive) from paired text–ima
 
 **Pipeline:**
 
+```mermaid
+flowchart TD
+    TXT["Text"] --> ROB["RoBERTa-base (frozen)<br/>token features [B, L_t, 768]"]
+    IMG["Image"] --> DEN["DenseNet-121 (frozen)<br/>spatial features [B, 1024, 7, 7]"]
+
+    ROB --> PT["Projection + LayerNorm<br/>H_t [B, L_t, 512]"]
+    DEN --> PV["Projection + LayerNorm<br/>H_v [B, 49, 512]"]
+
+    PT --> CO["Deep Gated Bi-CoAttention (2 layers)"]
+    PV --> CO
+
+    PT --> POOLT["masked mean-pool: h_t"]
+    PV --> POOLV["mean-pool: h_v"]
+    CO --> POOLC["pool + concat + MLP: h_c"]
+
+    POOLT --> ET["ENN head t: alpha_t"]
+    POOLV --> EV["ENN head v: alpha_v"]
+    POOLC --> EC["ENN head c: alpha_c"]
+
+    ET --> ST["Subjective Logic: b_t, u_t"]
+    EV --> SV["Subjective Logic: b_v, u_v"]
+    EC --> SC["Subjective Logic: b_c, u_c"]
+
+    ST --> FUS["ADEF Fusion<br/>discounting + K_tv + soft gate<br/>+ Route A / Route B blending"]
+    SV --> FUS
+    SC --> FUS
+
+    FUS --> OUT["p_final = b* + u*/K<br/>argmax -> Negative / Neutral / Positive"]
+```
+
+*ASCII summary:*
+
 ```
 text ──► RoBERTa (frozen) ─► H_t ─┐                          ┌─► ENN_t ─► (b_t, u_t) ─┐
                                   ├─► Gated Bi-CoAttention ─► ├─► ENN_v ─► (b_v, u_v) ─┼─► ADEF fusion ─► p_final
@@ -141,6 +173,31 @@ Because $\mathrm{Dempster}(\text{vacuous}, \omega) = \omega$, this forces the fu
 
 ## 7. Stage 5 — ADEF Fusion Module *(Cell 8)*
 
+```mermaid
+flowchart LR
+    BT["b_t, u_t"] --> DT["discount r_t"]
+    BV["b_v, u_v"] --> DV["discount r_v"]
+    BC["b_c, u_c"] --> DC["discount r_c"]
+
+    DT --> KTV["K_tv<br/>conflict mass"]
+    DV --> KTV
+    KTV --> GATE["soft gate<br/>g = sigmoid((K_tv - tau)/s)"]
+
+    DT --> RA["Route A:<br/>Dempster (t+v) then (+c)"]
+    DV --> RA
+    DC --> RA
+
+    DT --> RB["Route B:<br/>(1-K_tv)*avg + K_tv*b_c"]
+    DV --> RB
+    DC --> RB
+
+    RA --> MIX["b* = (1-g)*b_A + g*b_B<br/>u* = (1-g)*u_A + g*u_B"]
+    RB --> MIX
+    GATE --> MIX
+
+    MIX --> PF["p_final = b* + u*/K"]
+```
+
 ### 7.1 Jøsang reliability discounting (pre-fusion)
 
 Each branch learns a scalar reliability $r_m = \sigma(\rho_m)$, initialized at $\rho_m = 2.197 \Rightarrow r_m \approx 0.9$:
@@ -259,6 +316,21 @@ $$\boxed{\;\mathcal{L} = \mathcal{L}_{\text{sup}} + \lambda_f\, \mathcal{L}_{\te
 ## 10. Post-Hoc Decision Strategies (v3.1 / v3.2)
 
 All strategies are **tuned on the validation set only** and applied frozen to the test set.
+
+```mermaid
+flowchart TD
+    C1["3 seed checkpoints"] --> V["collect VAL predictions<br/>probs, u, g, K_tv"]
+    V --> R1["R1: u >= tau -> neutral"]
+    V --> R2["R2: margin <= tau -> neutral"]
+    V --> R3["R3: gate + p_max -> neutral<br/>(direction swept)"]
+    V --> R4["R4: class multipliers<br/>+ neutral floor"]
+    R1 --> SEL["select best on VAL macro-F1<br/>neutral-floor constrained"]
+    R2 --> SEL
+    R3 --> SEL
+    R4 --> SEL
+    SEL --> ENS["apply to DST ensemble<br/>re-tuned on ensemble val preds"]
+    ENS --> TST["evaluate ONCE on TEST<br/>+ conflict-subset analysis"]
+```
 
 ### 10.1 Class-evidence scaling (threshold tuning)
 
@@ -392,6 +464,17 @@ Uncertainty quality: $u(\text{incorrect}) = 0.451 > u(\text{correct}) = 0.362$ �
 | v3 | 2-layer gated co-attention, soft parametric gate, Jøsang discounting, vacuous-opinion dropout, digamma loss, label smoothing 0.05, sqrt-inv weights, dropout 0.45 | Macro-F1 0.6031 ± 0.011, Neu 0.361 |
 | v3.1 | smoothing→0, weights→inv, dropout→0.5, +checkpointing, +threshold tuning, +3-seed DST ensemble | Ensemble **0.6086 / Neu 0.377**; tuning ≈ neutral on per-seed, hurts ensemble |
 | v3.2 | +D1 diagnostic, +neutral rules R1–R4 (val-selected), +E10 oversampling arm, E9 checkpoint fix, both-direction gate sweep, neutral-floor tuning | *(run cell 17–19)* |
+
+**Notebook execution workflow (v3.2):**
+
+```mermaid
+flowchart LR
+    E1["Cell 16 — E1:<br/>3-seed training<br/>adef_v31 checkpoints"] --> D1["Cell 17 — D1:<br/>diagnostic<br/>conflict x label, u/g separation"]
+    D1 --> D2["Cell 18 — D2:<br/>neutral rules R1-R4<br/>tuned + selected on val"]
+    D2 --> E10["Cell 19 — E10:<br/>oversampling x2<br/>3 seeds + ensemble + best rule"]
+    E1 -.-> AB["Cell 20 — Ablations E2-E8<br/>(optional)"]
+    E1 -.-> E9["Cell 21 — E9:<br/>dataset characterization<br/>(optional)"]
+```
 
 ---
 
